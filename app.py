@@ -1,40 +1,59 @@
 """
-Judge and Charge Sentencing Dashboard
+Judge and Charge Sentencing Dashboard with Lazy Loading
 Analyze sentencing patterns by judge and charge type
 """
 
 import dash
-from dash import dcc, html, Input, Output, dash_table
+from dash import dcc, html, Input, Output, dash_table, callback
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import os
+from functools import lru_cache
 
 # Initialize the Dash app
-app = dash.Dash(__name__, 
+dash_app = dash.Dash(__name__, 
                 meta_tags=[{'name': 'viewport', 'content': 'width=device-width, initial-scale=1.0'}])
 
 # CRITICAL: Define server for deployment
-server = app.server
+server = dash_app.server
 
 # App title for browser tab
-app.title = "Judge and Charge Sentencing Dashboard"
+dash_app.title = "Judge and Charge Sentencing Dashboard"
 
+# Global variable to store data (lazy loading)
+_data_cache = None
+
+@lru_cache(maxsize=1)
 def load_data():
     """
-    Load criminal cases data with focus on sentencing information
+    Load criminal cases data with caching and lazy loading
     """
+    global _data_cache
+    
+    # If data is already cached, return it
+    if _data_cache is not None:
+        return _data_cache
+    
     try:
         # Check if file exists
         if not os.path.exists('cases.csv'):
             print("ERROR: cases.csv file not found!")
-            return create_sample_data()
+            _data_cache = create_sample_data()
+            return _data_cache
         
         print("Found cases.csv file, attempting to load...")
         
-        # Try to load the CSV file
-        df = pd.read_csv('cases.csv')
+        # Try to load the CSV file with proper data types to avoid warnings
+        dtype_dict = {
+            'AlcoholTestRefused': 'object',
+            'ComCntrl_Days': 'object',
+            'CommunityService': 'object'
+        }
+        
+        # Load with low_memory=False to avoid dtype warnings
+        df = pd.read_csv('cases.csv', dtype=dtype_dict, low_memory=False)
         
         print(f"Successfully loaded CSV with shape: {df.shape}")
         print(f"Columns found: {list(df.columns)}")
@@ -42,7 +61,8 @@ def load_data():
         # Check if we have any data
         if len(df) == 0:
             print("ERROR: CSV file is empty!")
-            return create_sample_data()
+            _data_cache = create_sample_data()
+            return _data_cache
         
         # Clean up any potential BOM characters from the CSV
         df.columns = df.columns.str.replace('\ufeff', '')
@@ -52,7 +72,7 @@ def load_data():
         for col in date_columns:
             if col in df.columns:
                 try:
-                    df[col] = pd.to_datetime(df[col])
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
                     print(f"Successfully converted {col} to datetime")
                 except:
                     print(f"Warning: Could not convert {col} to datetime")
@@ -65,6 +85,8 @@ def load_data():
             if col in df.columns:
                 try:
                     df[col] = df[col].astype(str).str.strip()
+                    # Replace 'nan' strings with actual NaN
+                    df[col] = df[col].replace(['nan', 'NaN', ''], pd.NA)
                     print(f"Cleaned column: {col}")
                 except:
                     print(f"Warning: Could not clean column: {col}")
@@ -76,25 +98,29 @@ def load_data():
         else:
             df['Jail_Days'] = 0
             
-        # For probation
+        # For probation (handling all time units)
+        df['Probation_Days_Clean'] = 0
         if 'Probation_Days' in df.columns:
-            df['Probation_Days_Clean'] = pd.to_numeric(df['Probation_Days'], errors='coerce').fillna(0)
-        elif 'Probation_Mths' in df.columns:
-            df['Probation_Days_Clean'] = pd.to_numeric(df['Probation_Mths'], errors='coerce').fillna(0) * 30
-        elif 'Probation_Yrs' in df.columns:
-            df['Probation_Days_Clean'] = pd.to_numeric(df['Probation_Yrs'], errors='coerce').fillna(0) * 365
-        else:
-            df['Probation_Days_Clean'] = 0
+            days = pd.to_numeric(df['Probation_Days'], errors='coerce').fillna(0)
+            df['Probation_Days_Clean'] += days
+        if 'Probation_Mths' in df.columns:
+            months = pd.to_numeric(df['Probation_Mths'], errors='coerce').fillna(0) * 30
+            df['Probation_Days_Clean'] += months
+        if 'Probation_Yrs' in df.columns:
+            years = pd.to_numeric(df['Probation_Yrs'], errors='coerce').fillna(0) * 365
+            df['Probation_Days_Clean'] += years
             
-        # For community control
+        # For community control (handling all time units)
+        df['CommunityControl_Days'] = 0
         if 'ComCntrl_Days' in df.columns:
-            df['CommunityControl_Days'] = pd.to_numeric(df['ComCntrl_Days'], errors='coerce').fillna(0)
-        elif 'ComCntrl_Mths' in df.columns:
-            df['CommunityControl_Days'] = pd.to_numeric(df['ComCntrl_Mths'], errors='coerce').fillna(0) * 30
-        elif 'ComCntrl_Yrs' in df.columns:
-            df['CommunityControl_Days'] = pd.to_numeric(df['ComCntrl_Yrs'], errors='coerce').fillna(0) * 365
-        else:
-            df['CommunityControl_Days'] = 0
+            days = pd.to_numeric(df['ComCntrl_Days'], errors='coerce').fillna(0)
+            df['CommunityControl_Days'] += days
+        if 'ComCntrl_Mths' in df.columns:
+            months = pd.to_numeric(df['ComCntrl_Mths'], errors='coerce').fillna(0) * 30
+            df['CommunityControl_Days'] += months
+        if 'ComCntrl_Yrs' in df.columns:
+            years = pd.to_numeric(df['ComCntrl_Yrs'], errors='coerce').fillna(0) * 365
+            df['CommunityControl_Days'] += years
             
         # For community service hours
         if 'CommunityService' in df.columns:
@@ -112,22 +138,31 @@ def load_data():
         
         # Create full judge name if components exist
         if all(col in df.columns for col in ['Judge_First_Name', 'Judge_Middle_Intial', 'Judge_Last_Name']):
-            df['Judge_Full_Name'] = df['Judge_First_Name'] + ' ' + df['Judge_Middle_Intial'].fillna('') + ' ' + df['Judge_Last_Name']
-            df['Judge_Full_Name'] = df['Judge_Full_Name'].str.strip()
+            # Handle missing values before concatenation
+            df['Judge_Full_Name'] = (
+                df['Judge_First_Name'].fillna('') + ' ' + 
+                df['Judge_Middle_Intial'].fillna('') + ' ' + 
+                df['Judge_Last_Name'].fillna('')
+            ).str.strip()
         elif 'Judge' in df.columns:
-            df['Judge_Full_Name'] = df['Judge']
+            df['Judge_Full_Name'] = df['Judge'].fillna('Unknown')
         else:
             df['Judge_Full_Name'] = 'Unknown'
             
         # Clean up judge names
-        df['Judge_Full_Name'] = df['Judge_Full_Name'].replace(['nan', 'NaN', ''], 'Unknown')
+        df['Judge_Full_Name'] = df['Judge_Full_Name'].replace(['', 'nan', 'NaN', None], 'Unknown')
+        df.loc[df['Judge_Full_Name'].isna(), 'Judge_Full_Name'] = 'Unknown'
         
         print(f"Data loaded successfully with {len(df)} rows and {len(df.columns)} columns")
+        _data_cache = df
         return df
         
     except Exception as e:
         print(f"ERROR loading data: {e}")
-        return create_sample_data()
+        import traceback
+        traceback.print_exc()
+        _data_cache = create_sample_data()
+        return _data_cache
 
 def create_sample_data():
     """
@@ -163,44 +198,213 @@ def create_sample_data():
     }
     return pd.DataFrame(sample_data)
 
-# Load the data
-print("Starting data load...")
-df = load_data()
+# Don't load data until first request (lazy loading)
+print("Dashboard initialized - data will be loaded on first request")
 
 # Safely get unique values for dropdowns
-def safe_get_unique(column_name):
+def safe_get_unique(column_name, df=None):
     """Safely get unique values from a column"""
+    if df is None:
+        df = load_data()
+    
     if column_name in df.columns:
         try:
-            unique_vals = [val for val in df[column_name].dropna().unique() if val and str(val) != 'nan']
+            unique_vals = df[column_name].dropna().unique()
+            # Filter out empty strings and convert to string
+            unique_vals = [str(val) for val in unique_vals if pd.notna(val) and str(val).strip() != '']
             return sorted(unique_vals)
         except:
             return []
     return []
 
 # Define the app layout
-app.layout = html.Div([
-    # Header section
-    html.Div([
-        html.H1("Judge and Charge Sentencing Dashboard", 
-                style={
-                    'textAlign': 'center',
-                    'color': '#2c3e50',
-                    'marginBottom': '10px',
-                    'fontFamily': 'Arial, sans-serif'
-                }),
-        
-        html.P(f"Analyzing sentencing patterns across {len(df):,} criminal cases",
-               style={
-                   'textAlign': 'center',
-                   'color': '#7f8c8d',
-                   'fontSize': '16px',
-                   'marginBottom': '20px'
-               })
-    ], style={'padding': '15px'}),
+dash_app.layout = html.Div([
+    # Loading overlay
+    dcc.Loading(
+        id="loading",
+        type="circle",
+        children=[
+            # Header section
+            html.Div([
+                html.H1("Judge and Charge Sentencing Dashboard", 
+                        style={
+                            'textAlign': 'center',
+                            'color': '#2c3e50',
+                            'marginBottom': '10px',
+                            'fontFamily': 'Arial, sans-serif'
+                        }),
+                
+                html.P("Analyzing sentencing patterns across criminal cases",
+                       style={
+                           'textAlign': 'center',
+                           'color': '#7f8c8d',
+                           'fontSize': '16px',
+                           'marginBottom': '20px'
+                       })
+            ], style={'padding': '15px'}),
+            
+            # Key metrics row
+            html.Div(id='key-metrics', style={'padding': '0 15px', 'marginBottom': '20px'}),
+            
+            # Filter Controls
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.Label("Select Judge:", style={'fontWeight': 'bold', 'marginBottom': '5px', 'fontSize': '14px'}),
+                        dcc.Dropdown(
+                            id='judge-filter',
+                            options=[],
+                            value='all',
+                            style={'marginBottom': '10px', 'fontSize': '12px'},
+                            searchable=True,
+                            placeholder="Loading judges..."
+                        )
+                    ], style={'width': '32%', 'display': 'inline-block', 'paddingRight': '10px'}),
+                    
+                    html.Div([
+                        html.Label("Select Charge:", style={'fontWeight': 'bold', 'marginBottom': '5px', 'fontSize': '14px'}),
+                        dcc.Dropdown(
+                            id='charge-filter',
+                            options=[],
+                            value='all',
+                            style={'marginBottom': '10px', 'fontSize': '12px'},
+                            searchable=True,
+                            placeholder="Loading charges..."
+                        )
+                    ], style={'width': '32%', 'display': 'inline-block', 'paddingLeft': '5px', 'paddingRight': '5px'}),
+                    
+                    html.Div([
+                        html.Label("Sentence Filter:", style={'fontWeight': 'bold', 'marginBottom': '5px', 'fontSize': '14px'}),
+                        dcc.Dropdown(
+                            id='sentence-filter',
+                            options=[
+                                {'label': 'All Cases', 'value': 'all'},
+                                {'label': 'With Sentence Only', 'value': 'with_sentence'},
+                                {'label': 'No Sentence Only', 'value': 'no_sentence'}
+                            ],
+                            value='all',
+                            style={'marginBottom': '10px', 'fontSize': '12px'}
+                        )
+                    ], style={'width': '32%', 'display': 'inline-block', 'paddingLeft': '10px'})
+                ])
+            ], style={'padding': '0 20px', 'marginBottom': '20px'}),
+            
+            # Summary Statistics Section
+            html.Div([
+                html.H3("Sentencing Summary", 
+                       style={'textAlign': 'center', 'marginBottom': '15px', 'color': '#2c3e50'}),
+                html.Div(id='summary-stats', style={'padding': '10px'})
+            ], style={'padding': '15px', 'backgroundColor': '#f8f9fa', 'marginBottom': '20px'}),
+            
+            # Charts Section
+            html.Div([
+                # Sentencing distribution charts
+                html.Div([
+                    dcc.Graph(id='jail-distribution', style={'height': '400px'})
+                ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
+                
+                html.Div([
+                    dcc.Graph(id='probation-distribution', style={'height': '400px'})
+                ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
+                
+                # Additional charts
+                html.Div([
+                    dcc.Graph(id='community-control-distribution', style={'height': '400px'})
+                ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
+                
+                html.Div([
+                    dcc.Graph(id='community-service-distribution', style={'height': '400px'})
+                ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
+                
+                # Comparative chart
+                html.Div([
+                    dcc.Graph(id='sentence-comparison', style={'height': '500px'})
+                ], style={'width': '100%', 'padding': '10px'})
+            ]),
+            
+            # Detailed Sentencing Table
+            html.Div([
+                html.H3("Detailed Sentencing Records", 
+                       style={'textAlign': 'center', 'marginBottom': '15px', 'color': '#2c3e50'}),
+                html.P("Click column headers to sort. Use filter boxes below headers to search.",
+                       style={'textAlign': 'center', 'color': '#7f8c8d', 'fontSize': '14px', 'marginBottom': '10px'}),
+                dash_table.DataTable(
+                    id='sentencing-table',
+                    columns=[
+                        {"name": "Judge", "id": "Judge_Full_Name"},
+                        {"name": "Charge", "id": "ChargeOffenseDescription"},
+                        {"name": "Statute", "id": "Statute"},
+                        {"name": "Jail Days", "id": "Jail_Days", "type": "numeric"},
+                        {"name": "Probation Days", "id": "Probation_Days_Clean", "type": "numeric"},
+                        {"name": "Comm. Control Days", "id": "CommunityControl_Days", "type": "numeric"},
+                        {"name": "Comm. Service Hours", "id": "CommunityService_Hours", "type": "numeric"},
+                        {"name": "Race", "id": "Race_Tier_1"},
+                        {"name": "Has Sentence", "id": "Has_Sentence"}
+                    ],
+                    data=[],
+                    style_cell={
+                        'textAlign': 'left', 
+                        'padding': '10px', 
+                        'fontSize': '12px',
+                        'whiteSpace': 'normal',
+                        'height': 'auto'
+                    },
+                    style_header={
+                        'backgroundColor': '#3498db', 
+                        'color': 'white', 
+                        'fontWeight': 'bold',
+                        'textAlign': 'center'
+                    },
+                    style_data={
+                        'backgroundColor': '#ecf0f1'
+                    },
+                    style_data_conditional=[
+                        {
+                            'if': {'row_index': 'odd'},
+                            'backgroundColor': 'white',
+                        },
+                        {
+                            'if': {'column_id': 'Has_Sentence', 'filter_query': '{Has_Sentence} = False'},
+                            'backgroundColor': '#ffcccc',
+                            'color': 'black',
+                        }
+                    ],
+                    page_size=50,
+                    sort_action="native",
+                    filter_action="native",
+                    export_format="csv"
+                )
+            ], style={'padding': '15px'})
+        ]
+    )
+], style={'backgroundColor': '#f8f9fa', 'minHeight': '100vh'})
+
+# Callback to initialize dropdowns and metrics on page load
+@dash_app.callback(
+    [Output('judge-filter', 'options'),
+     Output('charge-filter', 'options'),
+     Output('key-metrics', 'children')],
+    Input('judge-filter', 'value')  # Triggered on initial load
+)
+def initialize_dropdowns(_):
+    """
+    Initialize dropdowns with data on first load (lazy loading)
+    """
+    df = load_data()
     
-    # Key metrics row
-    html.Div([
+    # Get unique judges
+    judges = safe_get_unique('Judge_Full_Name', df)
+    judge_options = [{'label': 'All Judges', 'value': 'all'}] + \
+                   [{'label': judge, 'value': judge} for judge in judges]
+    
+    # Get unique charges
+    charges = safe_get_unique('ChargeOffenseDescription', df)
+    charge_options = [{'label': 'All Charges', 'value': 'all'}] + \
+                    [{'label': charge[:80] + '...' if len(charge) > 80 else charge, 'value': charge} 
+                     for charge in charges]
+    
+    # Create key metrics
+    metrics = html.Div([
         html.Div([
             html.H3(f"{len(df):,}", style={'margin': '0', 'color': '#3498db', 'fontSize': '24px'}),
             html.P("Total Cases", style={'margin': '0', 'fontSize': '12px'})
@@ -225,142 +429,12 @@ app.layout = html.Div([
             html.H3(f"{df['Probation_Days_Clean'].mean():.1f}", style={'margin': '0', 'color': '#e67e22', 'fontSize': '24px'}),
             html.P("Avg Probation Days", style={'margin': '0', 'fontSize': '12px'})
         ], style={'textAlign': 'center', 'backgroundColor': '#ecf0f1', 'padding': '15px', 'borderRadius': '8px', 'width': '19%', 'display': 'inline-block', 'margin': '0.5%'})
-    ], style={'padding': '0 15px', 'marginBottom': '20px'}),
+    ])
     
-    # Filter Controls
-    html.Div([
-        html.Div([
-            html.Div([
-                html.Label("Select Judge:", style={'fontWeight': 'bold', 'marginBottom': '5px', 'fontSize': '14px'}),
-                dcc.Dropdown(
-                    id='judge-filter',
-                    options=[{'label': 'All Judges', 'value': 'all'}] + 
-                            [{'label': judge, 'value': judge} for judge in safe_get_unique('Judge_Full_Name')],
-                    value='all',
-                    style={'marginBottom': '10px', 'fontSize': '12px'},
-                    searchable=True
-                )
-            ], style={'width': '32%', 'display': 'inline-block', 'paddingRight': '10px'}),
-            
-            html.Div([
-                html.Label("Select Charge:", style={'fontWeight': 'bold', 'marginBottom': '5px', 'fontSize': '14px'}),
-                dcc.Dropdown(
-                    id='charge-filter',
-                    options=[{'label': 'All Charges', 'value': 'all'}] + 
-                            [{'label': charge[:80] + '...' if len(charge) > 80 else charge, 'value': charge} 
-                             for charge in safe_get_unique('ChargeOffenseDescription')],
-                    value='all',
-                    style={'marginBottom': '10px', 'fontSize': '12px'},
-                    searchable=True
-                )
-            ], style={'width': '32%', 'display': 'inline-block', 'paddingLeft': '5px', 'paddingRight': '5px'}),
-            
-            html.Div([
-                html.Label("Sentence Filter:", style={'fontWeight': 'bold', 'marginBottom': '5px', 'fontSize': '14px'}),
-                dcc.Dropdown(
-                    id='sentence-filter',
-                    options=[
-                        {'label': 'All Cases', 'value': 'all'},
-                        {'label': 'With Sentence Only', 'value': 'with_sentence'},
-                        {'label': 'No Sentence Only', 'value': 'no_sentence'}
-                    ],
-                    value='all',
-                    style={'marginBottom': '10px', 'fontSize': '12px'}
-                )
-            ], style={'width': '32%', 'display': 'inline-block', 'paddingLeft': '10px'})
-        ])
-    ], style={'padding': '0 20px', 'marginBottom': '20px'}),
-    
-    # Summary Statistics Section
-    html.Div([
-        html.H3("Sentencing Summary", 
-               style={'textAlign': 'center', 'marginBottom': '15px', 'color': '#2c3e50'}),
-        html.Div(id='summary-stats', style={'padding': '10px'})
-    ], style={'padding': '15px', 'backgroundColor': '#f8f9fa', 'marginBottom': '20px'}),
-    
-    # Charts Section
-    html.Div([
-        # Sentencing distribution charts
-        html.Div([
-            dcc.Graph(id='jail-distribution', style={'height': '400px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
-        
-        html.Div([
-            dcc.Graph(id='probation-distribution', style={'height': '400px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
-        
-        # Additional charts
-        html.Div([
-            dcc.Graph(id='community-control-distribution', style={'height': '400px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
-        
-        html.Div([
-            dcc.Graph(id='community-service-distribution', style={'height': '400px'})
-        ], style={'width': '50%', 'display': 'inline-block', 'padding': '10px'}),
-        
-        # Comparative chart
-        html.Div([
-            dcc.Graph(id='sentence-comparison', style={'height': '500px'})
-        ], style={'width': '100%', 'padding': '10px'})
-    ]),
-    
-    # Detailed Sentencing Table
-    html.Div([
-        html.H3("Detailed Sentencing Records", 
-               style={'textAlign': 'center', 'marginBottom': '15px', 'color': '#2c3e50'}),
-        html.P("Click column headers to sort. Use filter boxes below headers to search.",
-               style={'textAlign': 'center', 'color': '#7f8c8d', 'fontSize': '14px', 'marginBottom': '10px'}),
-        dash_table.DataTable(
-            id='sentencing-table',
-            columns=[
-                {"name": "Judge", "id": "Judge_Full_Name"},
-                {"name": "Charge", "id": "ChargeOffenseDescription"},
-                {"name": "Statute", "id": "Statute"},
-                {"name": "Jail Days", "id": "Jail_Days", "type": "numeric"},
-                {"name": "Probation Days", "id": "Probation_Days_Clean", "type": "numeric"},
-                {"name": "Comm. Control Days", "id": "CommunityControl_Days", "type": "numeric"},
-                {"name": "Comm. Service Hours", "id": "CommunityService_Hours", "type": "numeric"},
-                {"name": "Race", "id": "Race_Tier_1"},
-                {"name": "Has Sentence", "id": "Has_Sentence"}
-            ],
-            data=[],
-            style_cell={
-                'textAlign': 'left', 
-                'padding': '10px', 
-                'fontSize': '12px',
-                'whiteSpace': 'normal',
-                'height': 'auto'
-            },
-            style_header={
-                'backgroundColor': '#3498db', 
-                'color': 'white', 
-                'fontWeight': 'bold',
-                'textAlign': 'center'
-            },
-            style_data={
-                'backgroundColor': '#ecf0f1'
-            },
-            style_data_conditional=[
-                {
-                    'if': {'row_index': 'odd'},
-                    'backgroundColor': 'white',
-                },
-                {
-                    'if': {'column_id': 'Has_Sentence', 'filter_query': '{Has_Sentence} = False'},
-                    'backgroundColor': '#ffcccc',
-                    'color': 'black',
-                }
-            ],
-            page_size=50,
-            sort_action="native",
-            filter_action="native",
-            export_format="csv"
-        )
-    ], style={'padding': '15px'})
-], style={'backgroundColor': '#f8f9fa', 'minHeight': '100vh'})
+    return judge_options, charge_options, metrics
 
-# Callback for updating all components
-@app.callback(
+# Main callback for updating all components
+@dash_app.callback(
     [Output('summary-stats', 'children'),
      Output('jail-distribution', 'figure'),
      Output('probation-distribution', 'figure'),
@@ -376,15 +450,18 @@ def update_dashboard(selected_judge, selected_charge, selected_sentence):
     """
     Update all dashboard components based on filter selections
     """
+    # Load data (will use cache after first load)
+    df = load_data()
+    
     # Filter data based on selections
     filtered_df = df.copy()
     
     # Apply judge filter
-    if selected_judge != 'all':
+    if selected_judge and selected_judge != 'all':
         filtered_df = filtered_df[filtered_df['Judge_Full_Name'] == selected_judge]
     
     # Apply charge filter
-    if selected_charge != 'all':
+    if selected_charge and selected_charge != 'all':
         filtered_df = filtered_df[filtered_df['ChargeOffenseDescription'] == selected_charge]
     
     # Apply sentence filter
@@ -487,7 +564,7 @@ def update_dashboard(selected_judge, selected_charge, selected_sentence):
         cs_fig.update_layout(title="Community Service Distribution")
     
     # Create comparison chart
-    if selected_judge != 'all' and len(filtered_df) > 0:
+    if selected_judge and selected_judge != 'all' and len(filtered_df) > 0:
         # Show charge breakdown for selected judge
         charge_summary = filtered_df.groupby('ChargeOffenseDescription').agg({
             'Jail_Days': 'mean',
@@ -511,7 +588,7 @@ def update_dashboard(selected_judge, selected_charge, selected_sentence):
             xaxis_tickangle=-45,
             height=500
         )
-    elif selected_charge != 'all' and len(filtered_df) > 0:
+    elif selected_charge and selected_charge != 'all' and len(filtered_df) > 0:
         # Show judge breakdown for selected charge
         judge_summary = filtered_df.groupby('Judge_Full_Name').agg({
             'Jail_Days': 'mean',
@@ -561,13 +638,22 @@ def update_dashboard(selected_judge, selected_charge, selected_sentence):
     available_columns = [col for col in table_columns if col in filtered_df.columns]
     
     if available_columns and len(filtered_df) > 0:
-        table_data = filtered_df[available_columns].round({'Jail_Days': 0, 'Probation_Days_Clean': 0, 
-                                                          'CommunityControl_Days': 0, 'CommunityService_Hours': 0}).to_dict('records')
+        # Limit to 1000 rows for performance
+        table_data = filtered_df[available_columns].head(1000).round({
+            'Jail_Days': 0, 
+            'Probation_Days_Clean': 0, 
+            'CommunityControl_Days': 0, 
+            'CommunityService_Hours': 0
+        }).to_dict('records')
     else:
         table_data = []
     
     return (summary_stats, jail_fig, probation_fig, cc_fig, cs_fig, comparison_fig, table_data)
 
-# Run the app
+# CRITICAL FIX: Expose the Flask server as 'app' for gunicorn
+app = server  # This makes gunicorn's 'app:app' work
+
+# Run the app locally
 if __name__ == '__main__':
-    app.run_server(debug=False)
+    # Use the Dash app's run_server for local development
+    dash_app.run_server(debug=False)
